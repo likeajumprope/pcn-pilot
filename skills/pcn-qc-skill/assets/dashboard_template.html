@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PCN-Pilot QC</title>
+<style>
+:root{
+  color-scheme: light;
+  --surface:#fcfcfb; --panel:#ffffff; --line:#e4e3df; --text:#0b0b0b; --text2:#52514e; --muted:#8a8983;
+  --accent:#2a78d6; --good:#0ca30c; --warning:#fab219; --critical:#d03b3b; --neutral:#8a8983; --sel:#eaf2fc;
+}
+@media (prefers-color-scheme: dark){
+  :root{ color-scheme: dark;
+    --surface:#1a1a19; --panel:#232322; --line:#383835; --text:#ffffff; --text2:#c3c2b7; --muted:#8f8e86;
+    --accent:#3987e5; --sel:#22344a; }
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--surface);color:var(--text);font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+header{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;flex-wrap:wrap;gap:12px 20px;align-items:center}
+header h1{font-size:16px;margin:0;font-weight:600}
+header .sub{color:var(--text2);font-size:12px}
+.who{display:flex;gap:8px;flex-wrap:wrap;margin-left:auto;align-items:center}
+input,select,textarea,button{font:inherit;color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:6px 8px}
+input:focus,textarea:focus,button:focus-visible,select:focus{outline:2px solid var(--accent);outline-offset:1px}
+button{cursor:pointer}
+button:disabled{opacity:.45;cursor:not-allowed}
+.bar{padding:8px 16px;border-bottom:1px solid var(--line);display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.chip{border-radius:999px;padding:4px 12px}
+.chip[aria-pressed=true]{border-color:var(--accent);background:var(--sel)}
+main{display:grid;grid-template-columns:minmax(260px,340px) 1fr;height:calc(100vh - 118px);min-height:420px}
+#list{overflow:auto;border-right:1px solid var(--line)}
+.row{display:flex;gap:8px;align-items:center;padding:8px 12px;border-bottom:1px solid var(--line);cursor:pointer}
+.row[aria-selected=true]{background:var(--sel)}
+.row .name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.row .dec{color:var(--text2);font-size:12px;white-space:nowrap}
+.badge{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:600;white-space:nowrap;color:var(--text)}
+.badge i{width:16px;height:16px;border-radius:50%;display:inline-grid;place-items:center;font-style:normal;font-size:11px;color:#fff;flex:none}
+.PASS i{background:var(--good)} .WARN i{background:var(--warning);color:#0b0b0b} .FAIL i{background:var(--critical)} .SKIPPED i{background:var(--neutral)}
+#detail{overflow:auto;padding:16px 20px}
+#detail h2{font-size:18px;margin:0 0 4px;overflow-wrap:anywhere}
+.steps{display:grid;gap:8px;margin:14px 0}
+.step{border:1px solid var(--line);border-radius:8px;padding:8px 12px;background:var(--panel)}
+.step .head{display:flex;gap:10px;align-items:center}
+.step .title{font-weight:600}
+.step ul{margin:6px 0 0;padding-left:18px;color:var(--text2)}
+.step .skip{color:var(--muted);font-size:12px;margin-top:4px}
+.plot{max-width:100%;border:1px solid var(--line);border-radius:8px;display:block;margin:12px 0;background:#fcfcfb}
+table{border-collapse:collapse;font-size:12.5px;margin:8px 0}
+td,th{padding:3px 12px 3px 0;text-align:left;font-variant-numeric:tabular-nums}
+th{color:var(--text2);font-weight:500}
+.fixes label{display:block;border:1px solid var(--line);border-radius:8px;padding:8px 12px;margin:6px 0;background:var(--panel);cursor:pointer}
+.fixes small{color:var(--text2);display:block}
+.fixes code{font-size:12px;color:var(--text2);overflow-wrap:anywhere}
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
+.actions button{font-weight:600}
+textarea{width:100%;min-height:56px}
+.msg{font-size:12.5px;padding:6px 10px;border-radius:6px;border:1px solid var(--line);margin:8px 0}
+.msg.err{border-color:var(--critical)}
+.kbd{font:11px ui-monospace,monospace;border:1px solid var(--line);border-radius:4px;padding:0 4px;color:var(--text2)}
+.hint{color:var(--text2);font-size:12px}
+@media (max-width:760px){main{grid-template-columns:1fr;height:auto}#list{max-height:38vh;border-right:0;border-bottom:1px solid var(--line)}}
+</style>
+</head>
+<body>
+<header>
+  <div><h1>Normative-model QC: <span id="run"></span></h1><div class="sub" id="summary"></div></div>
+  <div class="who">
+    <input id="by" placeholder="Your name" aria-label="Reviewer name" size="16">
+    <input id="rid" placeholder="Institutional ID" aria-label="Institutional ID" size="14">
+    <select id="role" aria-label="Role"><option value="reviewer">Reviewer</option><option value="supervisor">Supervisor</option></select>
+    <button id="download" title="Save decisions made in this browser as a file">Download decisions</button>
+  </div>
+</header>
+<div class="bar" id="filters"></div>
+<main>
+  <div id="list" role="listbox" aria-label="Response variables" tabindex="0"></div>
+  <div id="detail"></div>
+</main>
+<script id="data" type="application/json">__PCN_DATA__</script>
+<script>
+(function(){
+"use strict";
+var D = JSON.parse(document.getElementById("data").textContent);
+var feats = D.features, decisions = D.decisions || {}, pending = [], online = false;
+var ICON = {PASS:"✓", WARN:"!", FAIL:"✕", SKIPPED:"–"};
+var LABEL = {pass:"Pass", accept_warn:"Accept with caveat", fix:"Fix", dismiss:"Dismiss", escalate:"Escalate"};
+var filter = "ALL", query = "", sel = 0, view = [];
+function $(id){return document.getElementById(id);}
+function el(tag, attrs, kids){var e=document.createElement(tag);attrs=attrs||{};for(var k in attrs){if(k==="text")e.textContent=attrs[k];else if(k==="cls")e.className=attrs[k];else e.setAttribute(k,attrs[k]);}(kids||[]).forEach(function(c){e.appendChild(c);});return e;}
+function badge(status){return el("span",{cls:"badge "+status},[el("i",{text:ICON[status]||"?","aria-hidden":"true"}),document.createTextNode(status)]);}
+function fmt(v){if(v===null||v===undefined)return "";if(typeof v==="number"){return Math.abs(v)>=1000||Number.isInteger(v)?String(Math.round(v*100)/100):v.toFixed(3);}return String(v);}
+try{$("by").value=localStorage.getItem("pcn_by")||"";$("rid").value=localStorage.getItem("pcn_id")||"";}catch(e){}
+["by","rid"].forEach(function(k){$(k).addEventListener("change",function(){try{localStorage.setItem(k==="by"?"pcn_by":"pcn_id",$(k).value);}catch(e){}});});
+
+function matches(f){
+  var d = decisions[f.response_var];
+  if(query && f.response_var.toLowerCase().indexOf(query)<0) return false;
+  if(filter==="ALL") return true;
+  if(filter==="UNDECIDED") return !d;
+  if(filter==="OPEN") return d && (d.decision==="fix"||d.decision==="escalate");
+  return f.grade===filter;
+}
+function renderFilters(){
+  var bar=$("filters"); bar.textContent="";
+  var n={ALL:feats.length,FAIL:0,WARN:0,PASS:0,UNDECIDED:0,OPEN:0};
+  feats.forEach(function(f){n[f.grade]++;var d=decisions[f.response_var];if(!d)n.UNDECIDED++;else if(d.decision==="fix"||d.decision==="escalate")n.OPEN++;});
+  [["ALL","All"],["FAIL","Fail"],["WARN","Warn"],["PASS","Pass"],["UNDECIDED","Undecided"],["OPEN","Fix or escalated"]].forEach(function(p){
+    var b=el("button",{cls:"chip","aria-pressed":String(filter===p[0]),text:p[1]+" "+n[p[0]]});
+    b.addEventListener("click",function(){filter=p[0];sel=0;render();});bar.appendChild(b);});
+  var s=el("input",{placeholder:"Search variables","aria-label":"Search variables",size:"22"});s.value=query;
+  s.addEventListener("input",function(){query=s.value.toLowerCase();sel=0;renderList();renderDetail();});
+  bar.appendChild(s);
+  bar.appendChild(el("span",{cls:"hint",text:"Keys: j/k move, p pass, a accept with caveat, f fix, d dismiss, e escalate"}));
+  $("summary").textContent = (D.dataset_notes||[]).map(function(t){return "Note: "+t+". ";}).join("") + D.counts.PASS+" pass, "+D.counts.WARN+" warn, "+D.counts.FAIL+" fail by the agent. "+
+    (feats.length-n.UNDECIDED)+" of "+feats.length+" decided. "+(online?"Decisions are saved to the project.":"Offline copy: use Download decisions, then import with qc_decide.py.");
+}
+function renderList(){
+  var list=$("list"); list.textContent=""; view=feats.filter(matches);
+  if(sel>=view.length) sel=Math.max(0,view.length-1);
+  view.forEach(function(f,i){
+    var d=decisions[f.response_var];
+    var r=el("div",{cls:"row",role:"option","aria-selected":String(i===sel)},[badge(f.grade),el("span",{cls:"name",text:f.response_var,title:f.response_var}),el("span",{cls:"dec",text:d?LABEL[d.decision]:""})]);
+    r.addEventListener("click",function(){sel=i;renderList();renderDetail();});
+    list.appendChild(r);
+  });
+  if(!view.length) list.appendChild(el("div",{cls:"row",text:"No variable matches this filter."}));
+  var cur=list.querySelector('[aria-selected="true"]'); if(cur&&cur.scrollIntoView) cur.scrollIntoView({block:"nearest"});
+}
+function renderDetail(){
+  var box=$("detail"); box.textContent=""; var f=view[sel]; if(!f) return;
+  var d=decisions[f.response_var];
+  box.appendChild(el("h2",{text:f.response_var}));
+  var head=el("div",{},[document.createTextNode("Agent grade: "),badge(f.grade)]);
+  box.appendChild(head);
+  if(d){box.appendChild(el("div",{cls:"msg",text:"Current decision: "+LABEL[d.decision]+(d.fix_label?" ("+d.fix_label+")":"")+" by "+d.by+" ("+d.id+", "+d.role+") at "+d.at+(d.note?". Reason: "+d.note:"")}));}
+  (f.notes||[]).forEach(function(n){box.appendChild(el("div",{cls:"msg",text:n}));});
+  var steps=el("div",{cls:"steps"});
+  Object.keys(D.step_titles).forEach(function(k){
+    var s=f.steps[k]; var st=el("div",{cls:"step"},[el("div",{cls:"head"},[badge(s.status),el("span",{cls:"title",text:k+"  "+D.step_titles[k]})])]);
+    if(s.flags.length){var ul=el("ul");s.flags.forEach(function(fl){ul.appendChild(el("li",{text:fl.severity+": "+fl.message}));});st.appendChild(ul);}
+    (s.skipped||[]).forEach(function(t){st.appendChild(el("div",{cls:"skip",text:"Not checked: "+t}));});
+    steps.appendChild(st);});
+  box.appendChild(steps);
+  if(f.plot){var img=el("img",{cls:"plot",src:f.plot,loading:"lazy",alt:"Diagnostic plots for "+f.response_var});box.appendChild(img);}
+  var tb=el("table"); var keys=Object.keys(f.metrics).filter(function(k){return k!=="response_var"&&typeof f.metrics[k]!=="object";});
+  for(var i=0;i<keys.length;i+=3){var tr=el("tr");keys.slice(i,i+3).forEach(function(k){tr.appendChild(el("th",{text:k}));tr.appendChild(el("td",{text:fmt(f.metrics[k])}));});tb.appendChild(tr);}
+  box.appendChild(tb);
+  var fx=el("div",{cls:"fixes"});
+  if(f.fix_candidates.length){fx.appendChild(el("div",{cls:"title",text:"Repair candidates, ranked. A fix is refitted under a new run name; nothing is overwritten."}));
+    f.fix_candidates.forEach(function(c,i){
+      var rb=el("input",{type:"radio",name:"fix",value:c.id}); if((d&&d.fix_id===c.id)||(!d&&i===0)) rb.checked=true;
+      fx.appendChild(el("label",{},[rb,document.createTextNode(" "+c.id+". "+c.label),el("small",{text:c.why}),el("code",{text:c.change?JSON.stringify(c.change):"no refit: review the inputs"})]));});}
+  box.appendChild(fx);
+  var note=el("textarea",{id:"note",placeholder:"Reason (required to accept with caveat, dismiss, escalate, or to pass a variable the agent failed)","aria-label":"Reason"});
+  box.appendChild(note);
+  var act=el("div",{cls:"actions"});
+  [["pass","Pass","p"],["accept_warn","Accept with caveat","a"],["fix","Fix","f"],["dismiss","Dismiss","d"],["escalate","Escalate","e"]].forEach(function(a){
+    var b=el("button",{text:a[1]+" "}); b.appendChild(el("span",{cls:"kbd",text:a[2]}));
+    if(a[0]==="fix"&&!f.fix_candidates.length) b.disabled=true;
+    b.addEventListener("click",function(){decide(a[0]);}); act.appendChild(b);});
+  box.appendChild(act);
+  box.appendChild(el("div",{id:"status",cls:"hint"}));
+}
+function render(){renderFilters();renderList();renderDetail();}
+function say(text,err){var s=$("status"); if(s){s.textContent=text; s.className=err?"msg err":"hint";}}
+function decide(kind){
+  var f=view[sel]; if(!f) return;
+  var by=$("by").value.trim(), rid=$("rid").value.trim();
+  if(!by||!rid){say("Enter your name and institutional ID first (top right).",true);return;}
+  var note=($("note")||{}).value||""; var fixEl=document.querySelector('input[name="fix"]:checked');
+  var row={response_var:f.response_var,decision:kind,fix_id:kind==="fix"&&fixEl?fixEl.value:null,note:note.trim(),by:by,id:rid,role:$("role").value};
+  if((kind==="accept_warn"||kind==="dismiss"||kind==="escalate")&&!row.note){say("A written reason is required for this decision.",true);return;}
+  if(kind==="pass"&&f.grade==="FAIL"&&!row.note){say("The agent graded this FAIL. Passing it is an override and needs a written reason.",true);return;}
+  function done(saved){decisions[f.response_var]=saved; if(sel<view.length-1&&filter!=="UNDECIDED"&&filter!=="OPEN") sel++; render(); say("Saved.");}
+  if(!online){row.at=new Date().toISOString();row.agent_grade=f.grade;pending.push(row);var c=f.fix_candidates.filter(function(x){return x.id===row.fix_id;})[0];row.fix_label=c?c.label:null;done(row);return;}
+  fetch("api/decision",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(row)})
+    .then(function(r){return r.json().then(function(j){return {ok:r.ok,j:j};});})
+    .then(function(res){if(res.ok){done(res.j);}else{say(res.j.error||"The server refused the decision.",true);}})
+    .catch(function(){say("Could not reach the QC server. The decision was NOT saved.",true);});
+}
+$("download").addEventListener("click",function(){
+  var rows=online?Object.keys(decisions).map(function(k){return decisions[k];}):pending;
+  var blob=new Blob([JSON.stringify({run:D.run,decisions:rows},null,2)],{type:"application/json"});
+  var a=el("a",{href:URL.createObjectURL(blob),download:"decisions_"+D.run+".json"});document.body.appendChild(a);a.click();a.remove();});
+document.addEventListener("keydown",function(e){
+  var t=e.target.tagName; if(t==="INPUT"||t==="TEXTAREA"||t==="SELECT"||e.metaKey||e.ctrlKey||e.altKey) return;
+  var map={p:"pass",a:"accept_warn",f:"fix",d:"dismiss",e:"escalate"};
+  if(e.key==="j"||e.key==="ArrowDown"){if(sel<view.length-1){sel++;renderList();renderDetail();}e.preventDefault();}
+  else if(e.key==="k"||e.key==="ArrowUp"){if(sel>0){sel--;renderList();renderDetail();}e.preventDefault();}
+  else if(map[e.key]){decide(map[e.key]);e.preventDefault();}
+});
+$("run").textContent=D.run;
+render();
+if(location.protocol.indexOf("http")===0){
+  fetch("api/decisions").then(function(r){if(!r.ok)throw 0;return r.json();}).then(function(j){online=true;decisions=j;render();}).catch(function(){render();});
+}
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,20 @@
+{
+  "_comment": "Fixed globally and applied identically to every run. Relative rules grade a response variable against the other variables of the same run; absolute floors are the safety net. Change these only with a supervisor's sign-off, and never per cohort.",
+  "min_n_reliable": 50,
+  "extreme_abs_z": 10.0,
+  "z_mean": {"warn": 0.15, "fail": 0.30, "z_stat": 3.0},
+  "z_sd": {"warn": [0.85, 1.15], "fail": [0.70, 1.30], "z_stat": 3.0},
+  "z_skew": {"warn": 0.5, "fail": 1.0, "z_stat": 3.0},
+  "z_kurt": {"warn": 1.0, "fail": 3.0, "z_stat": 3.0},
+  "tail_196": {"expected": 0.05, "warn_low": 0.02, "warn_high": 0.09, "p": 0.001},
+  "mace": {"warn": 0.05, "fail": 0.10},
+  "msll_floor": 0.0,
+  "expv_floor": 0.0,
+  "cohort_modified_z": 3.5,
+  "cohort_min_features": 10,
+  "site": {"min_n": 10, "mean_warn": 0.3, "mean_fail": 0.6, "z_stat": 3.5, "sd_ratio": [0.7, 1.3], "sd_min_n": 30},
+  "cov": {"rho_warn": 0.15, "p": 0.001, "bins": 5, "bin_min_n": 20, "bin_mean_warn": 0.4},
+  "centile_cross": {"warn": 0.0, "fail": 0.01},
+  "overfit": {"sd_gap": 0.15},
+  "hbr": {"rhat_warn": 1.05, "rhat_fail": 1.10, "ess_warn": 400, "ess_fail": 100, "div_fail_frac": 0.01}
+}
