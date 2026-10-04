@@ -33,9 +33,13 @@ is examined.
 ## 2. Decision order
 
 1. A reference model was given: transfer or extend (see `transfer_extend.md`). The algorithm and
-   basis come from the reference model.
+   basis come from the reference model. Without `--goal`, the script proposes transfer, except for
+   a BLR reference fitted without a warp: PCNtoolkit up to 1.3.0 cannot transfer those, so it
+   proposes extend and says why.
 2. `--prefer` was given: that algorithm.
-3. Every value in (0, 1): HBR with a Beta likelihood and min-max scaling.
+3. Every value in (0, 1): HBR with a Beta likelihood and no output scaling (`"outscaler": "none"`).
+   Min-max scaling would map the training minimum and maximum to the edges of (0, 1) and send
+   every held-out value beyond them to z = plus or minus infinity; the plan refuses that pairing.
 4. More than 50 variables or more than 20,000 training rows: BLR. It fits each variable in seconds;
    HBR runs MCMC per variable.
 5. At least 5 batch levels and the smallest has fewer than 30 rows: HBR, because hierarchical priors
@@ -63,8 +67,9 @@ that surfaces in QC, and the fix is a second run for those variables only.
   "outscaler": "standardize",
   "y_transform": null,
   "saveplots": false,
+  "seed": 20260101,
   "blr": {
-    "n_iter": 1000, "tol": 1e-8, "optimizer": "l-bfgs-b",
+    "optimizer": "l-bfgs-b",
     "l_bfgs_b_epsilon": 0.1, "l_bfgs_b_l": 0.1, "l_bfgs_b_norm": "l2",
     "fixed_effect": true, "fixed_effect_slope": false,
     "heteroskedastic": true, "fixed_effect_var": false, "fixed_effect_var_slope": false,
@@ -89,10 +94,20 @@ that surfaces in QC, and the fix is a second run for those variables only.
 - `blr` keys are passed to `pcntoolkit.BLR` as written. `hbr` sampler keys (`draws`, `tune`,
   `chains`, `cores`, `nuts_sampler`, `init`) are passed to `pcntoolkit.HBR`; the other `hbr` keys
   build the priors and likelihood (`scripts/pcn_bridge.py`).
-- `y_transform`: `log1p` or `log`, only in PCNtoolkit versions that support it.
+- `inscaler`, `outscaler`: `standardize`, `minmax`, `robminmax` or `none`.
+- `y_transform`: refused with PCNtoolkit up to 1.3.0. That release computes correct z-scores with
+  `log` or `log1p` but inverts the transform once per compute step when it saves results, so the
+  centiles come out as infinity. Use a warp (BLR) or a SHASH likelihood (HBR) for skewed measures.
+- `saveplots`: PCNtoolkit's own QQ and centile plots at fit time, in `<run>/plots/`. `pcn-qc-skill`
+  draws its own diagnostic plots regardless. PCNtoolkit always writes its plots during a transfer.
+- `seed`: seeds the synthetic data of an extend run. HBR sampling takes no seed in PCNtoolkit
+  1.3.0, so an HBR refit reproduces z-scores only up to Monte Carlo error.
+- `transfer_kwargs`, `n_synth_samples`: see `transfer_extend.md`.
 - `rationale`, `alternatives`, `traits` are documentation and do not affect the fit.
 
-Unknown keys are refused at plan time with the list of keys the installed version accepts.
+Unknown keys are refused at plan time, at every level: recipe keys, `basis` keys (PCNtoolkit's
+basis functions would silently swallow a misspelt one), `blr` keys (with the list the installed
+version accepts), `hbr` keys and `transfer_kwargs`.
 
 ## 4. BLR options in plain terms
 
@@ -105,8 +120,14 @@ Unknown keys are refused at plan time with the list of keys the installed versio
 | `warp_name: warpsinharcsinh` | models skewness and tail weight | skewed or heavy-tailed measures (ventricles, lesion load) |
 | `warp_reparam` | a better-conditioned warp parameterisation | whenever the warp is used |
 | `optimizer: powell` | gradient-free optimiser | L-BFGS-B fails or returns non-finite likelihoods |
+| `l_bfgs_b_l`, `l_bfgs_b_norm` | strength and norm (`l1`, `l2`) of the penalty on the hyperparameters | rarely changed |
+| `n_iter`, `tol` | iteration cap and tolerance, read only by `optimizer: cg` | never with L-BFGS-B or Powell: they are ignored there. `cg` cannot be combined with a warp or a variance model |
 
-Other warps accepted by PCNtoolkit: `warpboxcox`, `warpaffine`, `warplog`, and `warpcompose(...)`.
+Other optimisers: `nelder-mead`, `cg`. Other warps accepted by PCNtoolkit: `warpboxcox`,
+`warpaffine`, `warplog`, and compositions written `warpcompose[warpaffine,warpsinharcsinh]`.
+
+A BLR model you may later want to transfer to another site must be fitted with a warp: see
+`transfer_extend.md`.
 
 ## 5. HBR options in plain terms
 

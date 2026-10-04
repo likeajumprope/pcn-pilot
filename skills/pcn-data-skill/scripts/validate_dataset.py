@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Step 8 of pcn-data-skill: validate the standardized dataset and write the report.
+"""Step 7 of pcn-data-skill: validate the standardized dataset (checks V01 to V14) and write the report.
 
     python validate_dataset.py --project <project>
 
@@ -20,6 +20,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _common import Project, audited, die, now, read_json, say, worst, write_json  # noqa: E402
 from profile_table import RX  # noqa: E402
+import pcn_bridge as B  # noqa: E402  (string rules only here; PCNtoolkit itself is not imported)
 
 ID, GROUP = "subject_id", "pcn_group"
 
@@ -217,6 +218,11 @@ def run_checks(project: Project) -> dict:
                 items.append(f"{x}: train/test means differ by {dlt:.2f} SD")
     c.add("V13", "Train and test are comparable on the covariates", "WARN" if items else "PASS",
           f"{len(items)} covariates imbalanced", items)
+
+    # V14 names PCNtoolkit can store ---------------------------------------------
+    bad_names = B.unstorable_names(rvs)
+    c.add("V14", "Response-variable names survive PCNtoolkit's result files", "FAIL" if bad_names else "PASS",
+          f"{len(bad_names)} of {len(rvs)} names cannot be stored", [f"{n}: {why}" for n, why in bad_names.items()])
 
     overall = worst(r["status"] for r in c.rows)
     return {"validated_at": now(), "overall": overall, "checks": c.rows,

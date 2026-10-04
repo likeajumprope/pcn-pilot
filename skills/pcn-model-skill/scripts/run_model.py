@@ -6,14 +6,17 @@
     $PCN_PYTHON run_model.py status  --project P --run R
     $PCN_PYTHON run_model.py predict --project P --run R --data clinical|train|test|<csv> [--name NAME]
 
-plan     computes nothing: it freezes the recipe, lists what is still pending, checks a reference
-         model for compatibility and states how many jobs with which resources would start
+plan     fits nothing: it freezes the recipe, lists what is still pending, checks a reference
+         model for compatibility (R1 to R7) and states how many jobs with which resources would start
 run      executes the approved plan. Re-running is always safe: response variables that already
          have a saved model and test z-scores are skipped; only missing ones are (re)done
 status   reports what is on disk, plus the scheduler's view for cluster runs
 predict  scores another table (clinical cohort, train split, new data) with the fitted models
 
 One response variable failing never stops the others.
+
+Every PCNtoolkit call goes through pcn_bridge.py, which was verified against PCNtoolkit 1.3.0 and
+documents where that release differs from its documentation (transfer, extend, y_transform, Runner).
 """
 from __future__ import annotations
 
@@ -31,7 +34,7 @@ from _common import (EXIT_PARTIAL, Project, append_jsonl, audited, die, dismisse
                      pcntoolkit_version, read_json, read_jsonl, say, write_json)
 import pcn_bridge as B  # noqa: E402
 
-IGNORED_RECIPE_KEYS = ("rationale", "alternatives", "traits")
+IGNORED_RECIPE_KEYS = B.DOC_KEYS
 
 
 def recipe_core(recipe: dict) -> dict:
@@ -58,7 +61,7 @@ def pending_vars(rd: Path, rvs: list[str]) -> list[str]:
 # --------------------------------------------------------------------------
 # reference-model compatibility (transfer / extend)
 # --------------------------------------------------------------------------
-def reference_compat(ref_dir: str, mode: str, man: dict, project: Project) -> tuple[list[dict], list[str]]:
+def reference_compat(ref_dir: str, mode: str, man: dict, project: Project) -> tuple[list[dict], list[str], dict]:
     import pandas as pd
     out: list[dict] = []
 
@@ -66,6 +69,7 @@ def reference_compat(ref_dir: str, mode: str, man: dict, project: Project) -> tu
         out.append({"id": cid, "status": status, "detail": detail})
 
     model = B.load_model(ref_dir)
+    info = B.reference_info(model)
     train = pd.read_csv(project.data / "train.csv", dtype={c: str for c in [B.ID] + man["batch_effects"]})
 
     m_cov = list(getattr(model, "covariates", []) or [])
@@ -123,7 +127,13 @@ def reference_compat(ref_dir: str, mode: str, man: dict, project: Project) -> tu
                           "only once: transfer from the original reference instead, or use extend")
     else:
         add("R6", "PASS", "lineage: " + (" <- ".join(str(c) for c in chain if c) or "original model (no PCN-Pilot lineage file)"))
-    return out, shared
+
+    what = f"{info['kind']}" + (f" with warp {info['warp']}" if info["warp"] else (" without a warp" if info["kind"] == "BLR" else ""))
+    problems = B.route_problems(info, mode)
+    add("R7", "FAIL" if problems else "PASS",
+        "; ".join(problems) if problems else
+        f"the installed PCNtoolkit can run {mode.split('_')[0]} from this reference ({what})")
+    return out, shared, info
 
 
 # --------------------------------------------------------------------------
@@ -165,10 +175,15 @@ def cmd_plan(a) -> int:
     rvs = [v for v in rvs if v not in dismissed]
 
     compat: list[dict] = []
+    ref_info: dict = {}
     if recipe["mode"] != "fit_predict":
         B.quiet()
-        compat, shared = reference_compat(recipe["reference_model"], recipe["mode"], man, project)
+        compat, shared, ref_info = reference_compat(recipe["reference_model"], recipe["mode"], man, project)
         rvs = [v for v in rvs if v in shared]
+        try:                                  # an option the toolkit would swallow is refused now
+            B.check_transfer_kwargs(ref_info, recipe.get("transfer_kwargs"))
+        except B.RecipeError as e:
+            die(str(e), 2)
     else:
         try:                                  # fail now, not in job 37 of 200
             B.quiet()
@@ -195,6 +210,7 @@ def cmd_plan(a) -> int:
                       "qos": env["PCN_SLURM_QOS"]} if backend != "local" else {},
         "data_built_at": man["built_at"], "recipe_digest": digest(recipe_core(recipe)),
         "compatibility": compat, "pcntoolkit": pcntoolkit_version(),
+        "reference": {k: ref_info[k] for k in ("kind", "warp", "y_transform")} if ref_info else None,
     }
     rd.mkdir(parents=True, exist_ok=True)
     write_json(rd / "recipe.json", recipe)
@@ -212,6 +228,17 @@ def cmd_plan(a) -> int:
                                         f"{plan['resources']['memory']} / {plan['resources']['n_cores']} core(s) each"
                                         if backend != "local" else ": sequential in this process"))
     say(f"  output       {rd}")
+    if recipe["mode"] == "extend_predict":
+        say(f"  extend       local rows pooled with {recipe.get('n_synth_samples') or 'as many'} rows synthesised "
+            f"from the reference{'' if recipe.get('n_synth_samples') else ' as it was fitted on'}, seed {recipe['seed']}")
+    if recipe["mode"] == "transfer_predict":
+        say("  note         PCNtoolkit always writes its own QQ and centile plots during a transfer (<run>/plots)")
+    if recipe["mode"] == "fit_predict" and recipe["algorithm"] == "hbr":
+        say("  note         HBR sampling takes no seed in PCNtoolkit 1.3.0: a refit gives slightly different z-scores")
+    if backend != "local" and (project.data / "clinical.csv").exists():
+        say("  note         cluster jobs score train and test only: run `run_model.py predict --data clinical` afterwards")
+    if B.version_note():
+        say(f"  WARNING      {B.version_note()}")
     for c in compat:
         say(f"  [{c['status']:<7}] {c['id']} {c['detail']}")
     if any(c["status"] == "FAIL" for c in compat):
@@ -225,22 +252,32 @@ def cmd_plan(a) -> int:
 # --------------------------------------------------------------------------
 # run
 # --------------------------------------------------------------------------
-def write_status(rd: Path, rv: str, state: str, attempt: int, seconds: float, error: str = "", tb: str = "") -> None:
+def write_status(rd: Path, rv: str, state: str, attempt: int, seconds: float, error: str = "", tb: str = "",
+                 sampler: dict | None = None) -> None:
     write_json(rd / "status" / f"{rv}.json", {
         "response_var": rv, "state": state, "attempt": attempt, "seconds": round(seconds, 2), "at": now(),
-        "error": error, "traceback": tb, "pcntoolkit": pcntoolkit_version()})
+        "error": error, "traceback": tb, "pcntoolkit": pcntoolkit_version(),
+        "sampler": sampler})          # HBR only: divergences, which PCNtoolkit does not save with the model
 
 
-def fit_one(recipe: dict, rd: Path, ref, tr, te):
-    mode = recipe["mode"]
+def seed_of(recipe: dict) -> int:
+    return int(recipe.get("seed", B.RECIPE_DEFAULTS["seed"]))
+
+
+def fit_one(recipe: dict, rd: Path, ref, info: dict, train_df, test_df, man: dict, rv: str):
+    """Fit, transfer or extend one response variable. Fresh data objects: nothing carries over between variables."""
+    mode, plots = recipe["mode"], bool(recipe.get("saveplots", False))
+    te = B.make_normdata("test", test_df, man, [rv])
     if mode == "fit_predict":
         model = B.make_model(recipe, rd)
-        model.fit_predict(tr, te)
+        model.fit_predict(B.make_normdata("train", train_df, man, [rv]), te)
         return model
-    kw = dict(recipe.get("transfer_kwargs") or {}) if mode == "transfer_predict" else \
-        ({"n_synth_samples": recipe["n_synth_samples"]} if recipe.get("n_synth_samples") else {})
-    fn = ref.transfer_predict if mode == "transfer_predict" else ref.extend_predict
-    return fn(tr, te, save_dir=str(rd), **kw)
+    if mode == "transfer_predict":
+        return B.transfer(ref, B.make_normdata("train", train_df, man, [rv]), te, rd, info,
+                          recipe.get("transfer_kwargs"), plots)
+    model = B.model_like(ref, rd, plots)                       # extend: pooled refit (see pcn_bridge.py)
+    model.fit_predict(B.extend_fit_data(ref, train_df, man, [rv], recipe.get("n_synth_samples"), seed_of(recipe)), te)
+    return model
 
 
 def run_local(project: Project, man: dict, recipe: dict, rd: Path, pending: list[str], verbose: bool) -> None:
@@ -249,6 +286,7 @@ def run_local(project: Project, man: dict, recipe: dict, rd: Path, pending: list
     train_df, test_df = B.read_split(d / "train.csv", man), B.read_split(d / "test.csv", man)
     clin_df = B.read_split(d / "clinical.csv", man) if (d / "clinical.csv").exists() else None
     ref = B.load_model(recipe["reference_model"]) if recipe["mode"] != "fit_predict" else None
+    info = B.reference_info(ref) if ref is not None else {}
     n_ok = 0
     for i, rv in enumerate(pending, 1):
         prev = read_json(rd / "status" / f"{rv}.json") or {}
@@ -256,16 +294,15 @@ def run_local(project: Project, man: dict, recipe: dict, rd: Path, pending: list
         t0 = time.time()
         try:
             # fresh NormData per variable: a failure can never contaminate the next one
-            tr = B.make_normdata("train", train_df, man, [rv])
-            te = B.make_normdata("test", test_df, man, [rv])
-            fitted = fit_one(recipe, rd, ref, tr, te)
+            fitted = fit_one(recipe, rd, ref, info, train_df, test_df, man, rv)
+            sampler = B.sampler_diagnostics(fitted, rv)
             if not B.feature_done(rd, rv):
                 raise RuntimeError("PCNtoolkit returned without writing the model and test z-scores")
             if rv not in B.results_columns(rd, "train"):
                 fitted.predict(B.make_normdata("train", train_df, man, [rv]))
             if clin_df is not None and len(clin_df):
                 fitted.predict(B.make_normdata("clinical", clin_df, man, [rv]))
-            write_status(rd, rv, "ok", attempt, time.time() - t0)
+            write_status(rd, rv, "ok", attempt, time.time() - t0, sampler=sampler)
             n_ok += 1
             say(f"[{i}/{len(pending)}] ok      {rv}  ({time.time() - t0:.1f}s)")
         except KeyboardInterrupt:
@@ -284,11 +321,7 @@ def scheduler_status(rd: Path) -> dict | None:
     if not subs or not subs[-1].get("state_file") or not Path(subs[-1]["state_file"]).is_file():
         return None
     try:
-        pcn = B.import_pcn()
-        runner = pcn.Runner.load_from_state(subs[-1]["state_file"])
-        running, failed, finished = runner.check_jobs_status()
-        return {"running": len(running), "failed": len(failed), "finished": len(finished),
-                "failed_detail": {str(k): str(v)[:300] for k, v in dict(failed).items()}}
+        return B.scheduler_view(subs[-1]["state_file"])
     except Exception as e:  # noqa: BLE001
         return {"error": f"{type(e).__name__}: {e}"}
 
@@ -299,7 +332,7 @@ def run_cluster(project: Project, man: dict, recipe: dict, rd: Path, plan: dict,
     exe = "sbatch" if plan["backend"] == "slurm" else "qsub"
     if not shutil.which(exe) and not os.environ.get("PCN_SKIP_SCHEDULER_CHECK"):
         die(f"backend {plan['backend']} needs `{exe}` on PATH. Run this from a login node, or re-plan with --backend local.")
-    pcn = B.import_pcn()
+    B.import_pcn()
     B.quiet()
     sched = scheduler_status(rd)
     if sched and sched.get("running") and not force:
@@ -313,26 +346,28 @@ def run_cluster(project: Project, man: dict, recipe: dict, rd: Path, plan: dict,
         if res.get(key):
             os.environ[var] = res[key]       # read natively by sbatch
     d = project.data
-    train = B.make_normdata("train", B.read_split(d / "train.csv", man), man, pending)
+    train_df = B.read_split(d / "train.csv", man)
     test = B.make_normdata("test", B.read_split(d / "test.csv", man), man, pending)
-    runner = B.call_strict(
-        pcn.Runner, cross_validate=False, parallelize=True, environment=res["conda_env"],
-        job_type=plan["backend"], n_batches=n_batches, time_limit=res["time_limit"], memory=res["memory"],
-        n_cores=res["n_cores"], max_retries=res["max_retries"], preamble=res["preamble"],
-        log_dir=str(rd / "logs"), temp_dir=str(rd / "tmp"))
-    mode = recipe["mode"]
+    runner = B.make_runner(plan["backend"], n_batches, res, rd / "logs", rd / "tmp")
+    mode, plots, kwargs = recipe["mode"], bool(recipe.get("saveplots", False)), None
     if mode == "fit_predict":
-        runner.fit_predict(B.make_model(recipe, rd), train, test, save_dir=str(rd), observe=False)
+        model, train = B.make_model(recipe, rd), B.make_normdata("train", train_df, man, pending)
     else:
         ref = B.load_model(recipe["reference_model"])
-        fn = runner.transfer_predict if mode == "transfer_predict" else runner.extend_predict
-        fn(ref, train, test, save_dir=str(rd), observe=False)
-    state = Path(str(getattr(runner, "unique_temp_dir", "") or "")) / "runner_state.json"
+        info = B.reference_info(ref)
+        if mode == "transfer_predict":         # the jobs call the reference's own transfer_predict
+            model, train = ref, B.make_normdata("train", train_df, man, pending)
+            kwargs = B.check_transfer_kwargs(info, recipe.get("transfer_kwargs"))
+        else:                                  # extend: synthesise here, then the jobs run an ordinary fit
+            model = B.model_like(ref, rd, plots)
+            train = B.extend_fit_data(ref, train_df, man, pending, recipe.get("n_synth_samples"), seed_of(recipe))
+    sub = B.submit(runner, mode, model, train, test, rd, kwargs)
     append_jsonl(rd / "submissions.jsonl", {
-        "at": now(), "attempt": attempt, "n_jobs": n_batches, "n_variables": len(pending),
-        "state_file": str(state) if state.is_file() else "", "log_dir": str(getattr(runner, "unique_log_dir", ""))})
+        "at": now(), "attempt": attempt, "n_jobs": n_batches, "n_variables": len(pending), "variables": pending,
+        "seed": seed_of(recipe) if mode == "extend_predict" else None,
+        "state_file": sub["state_file"], "log_dir": sub["log_dir"], "jobs": sub["jobs"]})
     say(f"submitted {n_batches} job(s) for {len(pending)} variables (attempt {attempt}).")
-    say(f"logs: {getattr(runner, 'unique_log_dir', rd / 'logs')}")
+    say(f"logs: {sub['log_dir'] or rd / 'logs'}")
     say("Check progress with `run_model.py status`; when jobs finish, run `check_status.py post model`.")
 
 
@@ -376,6 +411,7 @@ def cmd_status(a) -> int:
     if plan is None:
         die(f"run '{a.run}' has no plan", 2)
     rvs = plan["response_vars"]
+    B.quiet()
     pending = pending_vars(rd, rvs)
     failed = [v for v in pending if (read_json(rd / "status" / f"{v}.json") or {}).get("state") == "failed"]
     say(f"run '{a.run}': {len(rvs) - len(pending)}/{len(rvs)} complete on disk, {len(failed)} failed, "
@@ -404,12 +440,30 @@ def cmd_predict(a) -> int:
     name = a.name or (a.data if a.data in named else Path(a.data).stem)
     if not path.is_file():
         die(f"table not found: {path}", 2)
+    if name == B.EXTEND_FIT_NAME or not name.strip() or any(c in name for c in "/\\"):
+        die(f"'{name}' cannot be used as a result name; pass another --name", 2)
+    plan, recipe = read_json(rd / "plan.json") or {}, read_json(rd / "recipe.json") or {}
+    if a.data in named and plan.get("data_built_at") not in (None, man["built_at"]):
+        die(f"the dataset was rebuilt after run '{a.run}' was planned: its {a.data} split no longer belongs to "
+            "this run's models. Fit a new run on the new build.")
     df = B.read_split(path, man)
     need = [B.ID] + man["covariates"] + B.batch_columns(man)
     missing = [c for c in need if c not in df.columns]
     if missing:
         die(f"{path} lacks standardized columns {missing}; build it with pcn-data-skill", 2)
-    model = B.load_model(rd)
+    # PCNtoolkit merges result files on the row number: a name can only ever hold one table
+    held = B.results_subject_ids(rd, name)
+    if held is not None and held != df[B.ID].astype(str).tolist():
+        die(f"results named '{name}' already exist in this run for a different table (other subjects or another "
+            "row order). PCNtoolkit would merge the two row by row; pass a new --name.", 2)
+    model = B.load_model(rd, own=True, saveplots=False)
+    unknown = B.unknown_batch_levels(model, df, man)
+    if unknown:
+        die(f"{path} has batch-effect labels the model was not fitted on: {unknown}. PCNtoolkit refuses such data "
+            "('Data is not compatible with the model'). Adapt the model to the new site first (transfer or extend), "
+            "or recode the labels in the data spec if they are the same sites under other names.")
+    if recipe.get("saveplots"):
+        say("note: PCNtoolkit's own plots are written when a model is fitted, not by `predict`")
     done = [v for v in B.fitted_response_vars(model) if v in df.columns]
     have = set() if a.force else B.results_columns(rd, name)
     todo = [v for v in done if v not in have]

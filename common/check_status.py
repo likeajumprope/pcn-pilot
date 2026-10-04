@@ -23,6 +23,9 @@ from _common import (EXIT_FAIL, EXIT_OK, EXIT_PARTIAL, Project, audited, ledger_
                      pcntoolkit_version, read_json, read_jsonl, say, write_json)
 
 
+VERIFIED_PCNTOOLKIT = "1.3.0"
+
+
 class Report:
     def __init__(self, title: str):
         self.title, self.lines, self.failed, self.partial = title, [], False, False
@@ -133,6 +136,9 @@ def pre_model(p: Project, a) -> Report:
         r.fail(f"pcntoolkit {ver} is a legacy 0.x release; v1.x is required")
     else:
         r.ok(f"pcntoolkit {ver}")
+        if not ver.startswith(VERIFIED_PCNTOOLKIT):
+            r.note(f"PCN-Pilot was verified against PCNtoolkit {VERIFIED_PCNTOOLKIT}; with {ver}, run "
+                   "selftest/run_selftest.py once with this interpreter before relying on the results")
     rd = p.run_dir(a.run)
     plan = read_json(rd / "plan.json")
     if plan is None:
@@ -149,11 +155,16 @@ def pre_model(p: Project, a) -> Report:
             r.ok(f"{exe} found")
         else:
             r.fail(f"backend {plan['backend']} selected but `{exe}` is not on PATH")
-        if not env.get("PCN_CONDA_ENV"):
-            r.fail("PCN_CONDA_ENV is empty: cluster jobs need the conda environment path")
-    weird = [v_ for v_ in plan["response_vars"] if "/" in v_ or "\\" in v_]
+        envdir = env.get("PCN_CONDA_ENV")
+        if not envdir:
+            r.fail("PCN_CONDA_ENV is empty: cluster jobs need the environment path")
+        elif not (Path(envdir) / "bin" / "python").exists():
+            r.fail(f"PCN_CONDA_ENV={envdir} has no bin/python: PCNtoolkit's Runner refuses such a path. Give the "
+                   "environment's root folder (the parent of bin/), not the interpreter")
+    from pcn_bridge import unstorable_names
+    weird = unstorable_names(plan["response_vars"])
     if weird:
-        r.fail(f"response-variable names contain path separators: {weird[:5]}")
+        r.fail(f"response-variable names PCNtoolkit cannot store (see check V14 of the data stage): {list(weird)[:5]}")
     try:
         rd.mkdir(parents=True, exist_ok=True)
         (rd / ".write_probe").write_text("x")

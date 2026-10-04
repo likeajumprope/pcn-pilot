@@ -43,7 +43,7 @@ def read_z(rd: Path, name: str) -> pd.DataFrame | None:
     p = rd / "results" / f"Z_{name}.csv"
     if not p.is_file():
         return None
-    z = pd.read_csv(p)
+    z = pd.read_csv(p, dtype={"subject_ids": str})       # IDs such as 000123 must not become the number 123
     if "observations" in z.columns:
         z = z.sort_values("observations", key=lambda c: pd.to_numeric(c, errors="coerce")).reset_index(drop=True)
     return z
@@ -55,7 +55,8 @@ def read_stats(rd: Path, name: str) -> pd.DataFrame | None:
     if not p.is_file():
         return None
     s = pd.read_csv(p, index_col=0)
-    known = {"EXPV", "MSLL", "SMSE", "RMSE", "Rho", "R2", "MACE", "MLL", "ShapiroW"}
+    known = {"EXPV", "MSLL", "SMSE", "RMSE", "Rho", "Rho_p", "R2", "MACE", "MAPE", "MLL", "ShapiroW",
+             "Skewness", "Kurtosis"}                 # the rows PCNtoolkit 1.3.0 writes
     if len(known & set(map(str, s.index))) >= len(known & set(map(str, s.columns))):
         s = s.T                                   # rows were statistics (PCNtoolkit's layout)
     return s.apply(pd.to_numeric, errors="coerce")
@@ -74,7 +75,8 @@ def align(z: pd.DataFrame, split: pd.DataFrame) -> tuple[pd.DataFrame | None, st
     return None, "z-score rows could not be matched to the split table"
 
 
-def centile_cross_fraction(rd: Path, name: str, rv: str, cache: dict) -> float | None:
+def centile_checks(rd: Path, name: str, rv: str, cache: dict) -> tuple[float, float] | None:
+    """(share of subjects whose centile curves cross, share of centile values that are not finite)."""
     if "df" not in cache:
         p = rd / "results" / f"centiles_{name}.csv"
         cache["df"] = pd.read_csv(p) if p.is_file() else None
@@ -82,13 +84,17 @@ def centile_cross_fraction(rd: Path, name: str, rv: str, cache: dict) -> float |
     if df is None or rv not in df.columns or not {"observations", "centile"} <= set(df.columns):
         return None
     try:
-        wide = df.pivot_table(index="observations", columns="centile", values=rv, aggfunc="first")
+        wide = df.pivot(index="observations", columns="centile", values=rv)
         wide = wide[sorted(wide.columns, key=float)]
         v = wide.to_numpy(float)
         if v.shape[1] < 2:
             return None
-        tol = 1e-9 * (np.nanstd(v) or 1.0)
-        return float((np.diff(v, axis=1) < -tol).any(axis=1).mean())
+        bad = ~np.isfinite(v)
+        fin = np.where(bad, np.nan, v)
+        tol = 1e-9 * (np.nanstd(fin) or 1.0) if (~bad).any() else 0.0
+        with np.errstate(invalid="ignore"):
+            cross = (np.diff(fin, axis=1) < -tol).any(axis=1)
+        return float(cross.mean()), float(bad.mean())
     except Exception:
         return None
 
@@ -98,13 +104,27 @@ def hbr_convergence(rd: Path, rv: str) -> dict | None:
     if not p.is_file():
         return None
     try:
+        import warnings
         import arviz as az
         idata = az.from_netcdf(str(p))
-        names = [v for v in idata.posterior.data_vars if "per_subject" not in v]
-        rhat = az.rhat(idata, var_names=names)
-        ess = az.ess(idata, var_names=names)
-        out = {"rhat_max": float(max(float(rhat[v].max()) for v in rhat.data_vars)),
-               "ess_min": float(min(float(ess[v].min()) for v in ess.data_vars))}
+        # Zero-size variables (a zero-sum offset over a single batch level, as in a model transferred to
+        # one site) and constants (R-hat undefined) are not sampled quantities: leave them out.
+        names = [v for v in idata.posterior.data_vars if "per_subject" not in v and idata.posterior[v].size > 0]
+        with warnings.catch_warnings(), np.errstate(all="ignore"):
+            warnings.simplefilter("ignore")
+            rhat = az.rhat(idata, var_names=names)
+            ess = az.ess(idata, var_names=names)
+        r_all, e_all = [], []
+        for v in names:
+            r, e = np.asarray(rhat[v].values, float).ravel(), np.asarray(ess[v].values, float).ravel()
+            keep = np.isfinite(r) & np.isfinite(e)
+            r_all.append(r[keep])
+            e_all.append(e[keep])
+        r_all, e_all = np.concatenate(r_all or [np.array([])]), np.concatenate(e_all or [np.array([])])
+        if not len(r_all):
+            return {"error": "no sampled parameter with a finite R-hat in idata.nc"}
+        out = {"rhat_max": float(r_all.max()), "ess_min": float(e_all.min())}
+        # PCNtoolkit 1.3.0 saves only the posterior group, so sampler diagnostics are normally absent
         if hasattr(idata, "sample_stats") and "diverging" in idata.sample_stats:
             dv = idata.sample_stats["diverging"]
             out["divergent_frac"] = float(dv.mean())
@@ -171,9 +191,9 @@ def grade_feature(rv: str, ctx: dict) -> dict:
     z = pd.to_numeric(z_all[rv], errors="coerce").to_numpy(float) if have_z else np.array([])
     if have_z and not np.isfinite(z).all():
         s.flag("NONFINITE_Z", "FAIL", f"{int((~np.isfinite(z)).sum())} of {len(z)} test z-scores are NaN or infinite")
-    conv = hbr_convergence(rd, rv)
+    conv = hbr_convergence(rd, rv) if model_file else None
     if conv is None:
-        if ctx["algorithm"] == "hbr":
+        if ctx["is_hbr"] and model_file:
             s.skipped.append("MCMC convergence: no idata.nc found for this variable")
         else:
             nlz = find_key(read_json(rd / "model" / rv / "regression_model.json") or {}, "nlZ")
@@ -190,9 +210,17 @@ def grade_feature(rv: str, ctx: dict) -> dict:
         if conv["ess_min"] < H["ess_warn"]:
             s.flag("HBR_ESS", "FAIL" if conv["ess_min"] < H["ess_fail"] else "WARN",
                    f"min effective sample size {conv['ess_min']:.0f}", conv["ess_min"])
-        if (conv.get("divergent_frac") or 0) > 0:
-            s.flag("HBR_DIVERGENT", "FAIL" if conv["divergent_frac"] > H["div_fail_frac"] else "WARN",
-                   f"{100 * conv['divergent_frac']:.2f}% divergent transitions", conv["divergent_frac"])
+        div = conv.get("divergent_frac")
+        if div is None and isinstance(st.get("sampler"), dict) and st.get("state") == "ok":
+            div = st["sampler"].get("divergent_frac")        # recorded by run_model.py when it fitted locally
+        m["divergent_frac"] = div
+        if div is None:
+            s.skipped.append("divergent transitions: PCNtoolkit saves only the posterior draws in idata.nc. "
+                             "Local runs record the sampler's divergence count at fit time; this run "
+                             "(cluster jobs, or a model fitted elsewhere) has no such record")
+        elif div > 0:
+            s.flag("HBR_DIVERGENT", "FAIL" if div > H["div_fail_frac"] else "WARN",
+                   f"{100 * div:.2f}% divergent transitions", div)
 
     usable = have_z and np.isfinite(z).sum() >= 8
     if not usable:
@@ -333,13 +361,19 @@ def grade_feature(rv: str, ctx: dict) -> dict:
                                                    "local misfit of the mean curve", worst_bin)
             except Exception:
                 pass
-        cross = centile_cross_fraction(rd, "test", rv, ctx["centile_cache"])
-        if cross is None:
+        cc = centile_checks(rd, "test", rv, ctx["centile_cache"])
+        if cc is None:
             s.skipped.append("centile ordering: centiles_test.csv not available or not parseable")
         else:
             s.ran = True
-            m["centile_cross_frac"] = cross
+            cross, nonfinite = cc
+            m["centile_cross_frac"], m["centile_nonfinite_frac"] = cross, nonfinite
             CC = T["centile_cross"]
+            if nonfinite > 0:
+                s.flag("CENTILE_NONFINITE", "FAIL",
+                       f"{100 * nonfinite:.1f}% of the saved centile values are infinite or missing: the centile "
+                       "file cannot be used (with PCNtoolkit up to 1.3.0 this is what y_transform produces)",
+                       nonfinite)
             if cross > CC["warn"]:
                 s.flag("CENTILE_CROSS", "FAIL" if cross > CC["fail"] else "WARN",
                        f"centile curves cross for {100 * cross:.1f}% of test subjects", cross)
@@ -362,7 +396,7 @@ def grade_feature(rv: str, ctx: dict) -> dict:
         for k in ("S2", "S4", "S5"):
             stp = out["steps"][k]
             for f in stp["flags"]:
-                if f["severity"] == "FAIL" and f["code"] not in ("CENTILE_CROSS", "EXTREME_Z"):
+                if f["severity"] == "FAIL" and f["code"] not in ("CENTILE_CROSS", "CENTILE_NONFINITE", "EXTREME_Z"):
                     f["severity"] = "WARN"
                     f["message"] += f" [downgraded: only {n} test subjects]"
             if stp["flags"]:
@@ -402,13 +436,19 @@ def fix_candidates(codes: list[str], recipe: dict, m: dict) -> list[dict]:
     trend = c & {"COV_TREND", "COV_BINS"}
     wiggly = c & {"OVERFIT", "CENTILE_CROSS"}
     broken = c & {"NOT_COMPLETED", "NONFINITE_Z"}
+    if "CENTILE_NONFINITE" in c and recipe.get("y_transform"):
+        add("Refit without y_transform", {"y_transform": None},
+            "PCNtoolkit up to 1.3.0 inverts the transform repeatedly when it saves centiles; "
+            "model the skew with a warp or a SHASH likelihood instead")
 
     if alg == "blr":
         if broken:
-            add("Refit with more optimiser iterations", {"blr": {"n_iter": 2000, "tol": 1e-8}},
-                "the optimiser may have stopped early")
-            add("Refit with the Powell optimiser", {"blr": {"optimizer": "powell"}},
-                "gradient-free; more robust when L-BFGS-B diverges, but slower")
+            if str(blr.get("optimizer", "l-bfgs-b")).lower() == "cg":       # the only optimiser that reads n_iter / tol
+                add("Refit with more optimiser iterations", {"blr": {"n_iter": 2000, "tol": 1e-8}},
+                    "conjugate gradients may have stopped early")
+            if str(blr.get("optimizer", "l-bfgs-b")).lower() != "powell":
+                add("Refit with the Powell optimiser", {"blr": {"optimizer": "powell"}},
+                    "gradient-free; more robust when L-BFGS-B diverges, but slower")
             if blr.get("warp_name"):
                 add("Refit without the warp", {"blr": {"warp_name": None, "warp_reparam": False}},
                     "warp parameters are the usual cause of non-finite likelihoods")
@@ -441,8 +481,7 @@ def fix_candidates(codes: list[str], recipe: dict, m: dict) -> list[dict]:
             if hbr.get("random_slope_mu") or hbr.get("random_intercept_sigma"):
                 add("Simplify the hierarchy", {"hbr": {"random_slope_mu": False, "random_intercept_sigma": False}},
                     "fewer random effects give an easier posterior")
-            add("Fall back to BLR", {"algorithm": "blr", "blr": {"fixed_effect": True, "heteroskedastic": True,
-                                                                 "n_iter": 1000, "tol": 1e-8}},
+            add("Fall back to BLR", {"algorithm": "blr", "blr": {"fixed_effect": True, "heteroskedastic": True}},
                 "no MCMC: use when the sampler will not converge")
         if shape and str(hbr.get("likelihood", "Normal")).lower() == "normal":
             add("Use the SHASH likelihood", {"hbr": {"likelihood": "SHASHb"}},
@@ -457,10 +496,12 @@ def fix_candidates(codes: list[str], recipe: dict, m: dict) -> list[dict]:
                 "noise level changes along the covariate")
     else:                                         # transferred / extended from a reference model
         if c & {"Z_MEAN", "SITE_MEAN", "Z_SD", "SITE_SD"}:
-            add("Use extend instead of transfer", {"mode": "extend_predict"},
-                "extend refits the full model on reference-synthesised plus local data")
-            add("Fit from scratch on your own reference data", {"mode": "fit_predict", "reference_model": None,
-                                                              "algorithm": "blr"},
+            if recipe.get("mode") != "extend_predict":
+                add("Use extend instead of transfer", {"mode": "extend_predict", "transfer_kwargs": None},
+                    "extend refits the full model on reference-synthesised plus local data")
+            add("Fit from scratch on your own reference data",
+                {"mode": "fit_predict", "reference_model": None, "algorithm": "blr", "transfer_kwargs": None,
+                 "n_synth_samples": None},
                 "only sensible with a few hundred local reference subjects; needs a full recipe from choose_recipe.py")
     if alg in ("blr", "hbr"):
         if trend:
@@ -615,7 +656,8 @@ def main(argv=None) -> int:
                 if k in stats_test.columns and stats_test[k].notna().sum() >= T["cohort_min_features"]:
                     col = stats_test[k].dropna()
                     cohort_z[k] = pd.Series(modified_z(col.to_numpy()), index=col.index)
-        ctx = {"T": T, "rd": rd, "recipe": recipe, "algorithm": recipe.get("algorithm", "blr"),
+        is_hbr = recipe.get("algorithm") == "hbr" or (plan.get("reference") or {}).get("kind") == "HBR"
+        ctx = {"T": T, "rd": rd, "recipe": recipe, "algorithm": recipe.get("algorithm", "blr"), "is_hbr": is_hbr,
                "z_test": z_test, "z_train": read_z(rd, "train"), "stats_test": stats_test, "cohort_z": cohort_z,
                "test_tab": test_tab, "train_tab": train, "align_how": how, "batch": man["batch_effects"],
                "cov": man["covariates"], "centile_cache": {},

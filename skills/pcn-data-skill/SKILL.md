@@ -22,7 +22,7 @@ A project folder (the user chooses where). Everything later stages need is under
 | `clean.csv`, `train.csv`, `test.csv`, `clinical.csv` | standardized tables; `clinical.csv` only if non-reference subjects exist |
 | `dropped.csv` | every observation that was left out, with the reason |
 | `build_manifest.json` | counts, source checksums, split seed |
-| `validation.json`, `data_report.md` | the 13 checks and the human-readable report |
+| `validation.json`, `data_report.md` | the 14 checks and the human-readable report |
 
 Sources are read-only. Only columns named in the spec are copied, so identifying columns never
 reach the project.
@@ -55,7 +55,9 @@ these together, not one prompt at a time:
   many IDs match under `strip`, `alnum`, `alnum_lower`)
 - covariates (age and its unit; any others) and batch effects (site/scanner, sex)
 - how categorical codes map to labels, for example sex `0/1` to `F/M`
-- which response variables to model (explicit list, a regex, or all numeric)
+- which response variables to model (explicit list, a regex, or all numeric). Names ending in
+  `_old`, and the names `observations`, `subject_ids`, `centile` and `statistic`, cannot be used:
+  PCNtoolkit's result files would lose them (check V14). Rename such a column in a copy of the source
 - the reference group: which column and values mark the population the norm should describe
   (usually healthy controls). Everyone else is scored but never used to fit
 - repeated measures: is there a visit column, and is a longitudinal design intended
@@ -126,5 +128,5 @@ the model stage will ask for a new run name.
 
 - `references/spec.md`: every field of `spec.json`, with examples for common layouts
   (FreeSurfer stats tables, BIDS `participants.tsv`, longitudinal data)
-- `references/validation_checks.md`: checks V01 to V13, what each means for a normative model,
+- `references/validation_checks.md`: checks V01 to V14, what each means for a normative model,
   and what to do

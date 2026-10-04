@@ -5,8 +5,8 @@
 
 Two source tables whose IDs are formatted differently, numeric sex coding, a
 diagnosis column, a PHI column, one sparse variable, one skewed variable, one
-heteroskedastic variable, a unit error, a tiny site, and a new site held back
-for transfer / extend tests. Nothing here is real data.
+heteroskedastic variable, a variable whose name ends in "_old", a unit error, a
+tiny site, and a new site held back for transfer / extend tests. Nothing here is real data.
 """
 import argparse
 from pathlib import Path
@@ -36,6 +36,7 @@ def cohort(n: int, sites: dict, rng, start: int = 0) -> tuple[pd.DataFrame, pd.D
     idp["vol_hetero"] = 5000 - 300 * a + 150 * off + rng.normal(0, 1, n) * (200 + 120 * (a + 2))
     idp["vol_site_var"] = 800 + 40 * a + rng.normal(0, 1, n) * np.where(off > 0.5, 120, 50)
     idp["sparse_measure"] = np.where(rng.random(n) < 0.4, np.nan, rng.normal(10, 1, n))
+    idp["vol_old"] = idp["vol_hetero"].to_numpy() * 0.5    # a name PCNtoolkit's result files cannot hold
     return demo, idp
 
 

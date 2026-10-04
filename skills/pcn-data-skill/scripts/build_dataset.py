@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Step 7 of pcn-data-skill: turn the confirmed spec into the standardized dataset.
+"""Steps 5 and 6 of pcn-data-skill: turn the confirmed spec into the standardized dataset.
 
     python build_dataset.py --project <project> [--spec spec.json] [--dry-run]
 

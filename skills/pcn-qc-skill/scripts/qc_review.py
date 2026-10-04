@@ -304,6 +304,23 @@ def cmd_export(a, project: Project) -> int:
     if not accepted:
         die("no accepted variable to export")
 
+    # Every accepted variable must have its scores: cluster jobs score train and test only, so a clinical
+    # table can be missing for a whole run. An export with silently absent columns would look complete.
+    if (project.data / "clinical.csv").exists():
+        missing: dict[str, list[str]] = {}
+        for r in runs:
+            cols = [rv for rv, v in accepted.items() if v["run"] == r]
+            z = read_z(project.run_dir(r), "clinical")
+            lack = [rv for rv in cols if z is None or rv not in z.columns]
+            if lack:
+                missing[r] = lack
+        if missing:
+            for r, lack in missing.items():
+                say(f"  run {r}: no clinical z-scores for {len(lack)} accepted variable(s) {lack[:8]}")
+                say(f"    run_model.py predict --project {project.root} --run {r} --data clinical")
+            die("export refused: the clinical subjects have not been scored for every accepted variable. "
+                "Run the predict command(s) above, then export again.")
+
     out = project.export_dir(a.name)
     if out.exists() and any(out.iterdir()):
         die(f"{out} already exists. Exports are never overwritten: choose another --name.", 2)

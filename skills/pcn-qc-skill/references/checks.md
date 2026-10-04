@@ -16,7 +16,7 @@
 - `results/Z_test.csv`: z-scores of held-out reference subjects (the basis of S2, S4, S5)
 - `results/Z_train.csv`: for the train/test comparison
 - `results/statistics_test.csv`: PCNtoolkit's own metrics (S3)
-- `results/centiles_test.csv`: centile values per subject (centile ordering)
+- `results/centiles_test.csv`: centile values per subject (centile ordering, finite values)
 - `model/<variable>/regression_model.json`, `idata.nc`: existence, BLR likelihood, MCMC diagnostics
 - `<project>/data/test.csv`, `train.csv`: covariates and batch labels of the same rows
 
@@ -53,6 +53,15 @@ Thresholds are in `assets/qc_thresholds.json`; the numbers below are its default
 
 MCMC diagnostics come from `idata.nc` through arviz. If it is missing or arviz is not installed
 the check is SKIPPED for HBR models: say so.
+
+PCNtoolkit 1.3.0 writes only the posterior group to `idata.nc`. R-hat and effective sample size
+are recomputed from those draws (constants and empty variables, such as the offset of a batch
+effect with a single level, are left out). The sampler statistics are not in the file, so:
+
+- local runs: `run_model.py` reads the divergence count from the model in memory right after each
+  fit and stores it in `status/<variable>.json`; `HBR_DIVERGENT` is evaluated from that record
+- cluster runs, and models fitted elsewhere: there is no record. S1 lists "divergent transitions"
+  under SKIPPED for those variables. Say so; if it matters, refit the variable locally
 
 ### S2 Calibration (held-out reference subjects)
 
@@ -92,6 +101,7 @@ in the run; smaller runs (for example fix runs) use the absolute floors only.
 | `COV_SPREAD` | Spearman of abs z with the covariate beyond 0.15: WARN | variance changes along the covariate and the model's does not |
 | `COV_BINS` | mean z in a covariate quintile beyond 0.4 and significant: WARN | local misfit (often at the ends of the age range) |
 | `CENTILE_CROSS` | centiles out of order for any subject / more than 1%: WARN / FAIL | invalid centile curves |
+| `CENTILE_NONFINITE` | any saved centile value is infinite or missing: FAIL | the centile file is unusable. With PCNtoolkit up to 1.3.0 this is what `y_transform` produces (the model stage refuses that option for this reason) |
 | `OVERFIT` | SD of z on test exceeds train by more than 0.15: WARN | the model fits training data better than new data |
 
 Test subjects outside the training covariate range are reported once as a dataset note, since
@@ -109,7 +119,7 @@ Candidates are ranked: cheapest and most targeted first. Each is a change to the
 | site variance differs | batch effect on the variance; then HBR | random site effect on sigma |
 | trend or local misfit along the covariate | B-spline basis; then more knots | same |
 | overfitting, crossing centiles | fewer knots | fewer knots |
-| not completed, non-finite | more iterations; Powell optimiser; drop the warp | longer warm-up; simpler hierarchy; BLR |
+| not completed, non-finite | Powell optimiser; drop the warp (more iterations only when the recipe uses `optimizer: cg`, the one optimiser that reads `n_iter` and `tol`) | longer warm-up; simpler hierarchy; BLR |
 | R-hat, ESS, divergences | | longer warm-up and more draws; simpler hierarchy; BLR |
 | extreme z | review the input data first | review the input data first |
 
@@ -141,6 +151,10 @@ One figure per flagged variable (`qc/<run>/plots/`), four panels:
 
 `n_test`, `z_mean`, `z_sd`, `z_skew`, `z_kurt`, `shapiro_w`, `frac_abs_z_gt_1_96`,
 `frac_abs_z_gt_3`, `mace_z`, `n_extreme_z`; PCNtoolkit's `EXPV`, `MSLL`, `SMSE`, `Rho`, `RMSE`,
-`R2`, `MACE`; `rho_z_<cov>`, `rho_absz_<cov>`, `max_bin_mean_z_<cov>`; `centile_cross_frac`;
-`z_sd_train`, `z_sd_gap`; `rhat_max`, `ess_min`, `divergent_frac`; then the grade, the status of
-each step and the flag codes.
+`R2`, `MACE`; `rho_z_<cov>`, `rho_absz_<cov>`, `max_bin_mean_z_<cov>`; `centile_cross_frac`,
+`centile_nonfinite_frac`;
+`z_sd_train`, `z_sd_gap`; `rhat_max`, `ess_min`, `divergent_frac` (empty with PCNtoolkit 1.3.0, see
+S1); then the grade, the status of each step and the flag codes.
+
+PCNtoolkit 1.3.0 writes these rows to `statistics_<name>.csv`: `EXPV`, `Kurtosis`, `MACE`, `MAPE`,
+`MLL`, `MSLL`, `R2`, `RMSE`, `Rho`, `Rho_p`, `SMSE`, `ShapiroW`, `Skewness`.

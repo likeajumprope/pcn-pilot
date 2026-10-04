@@ -80,6 +80,16 @@ def traits(train: pd.DataFrame, man: dict, seed: int = 0) -> dict:
     }
 
 
+def reference_facts(reference: str) -> dict:
+    """What the saved reference model is, read from its JSON (no PCNtoolkit import needed)."""
+    meta = read_json(Path(reference) / "model" / "normative_model.json")
+    if meta is None:
+        die(f"{reference} is not a saved PCNtoolkit model (no model/normative_model.json)", 2)
+    tmpl = meta.get("template_regression_model") or {}
+    return {"kind": tmpl.get("type"), "warp": tmpl.get("warp_name") or None,
+            "y_transform": meta.get("y_transform") or None, "ptk_version": meta.get("ptk_version")}
+
+
 def propose(t: dict, has_batch: bool, prefer: str | None, reference: str | None, goal: str | None) -> dict:
     why: list[str] = []
     alternatives: list[dict] = []
@@ -87,9 +97,25 @@ def propose(t: dict, has_batch: bool, prefer: str | None, reference: str | None,
 
     # ---- reference-model routes
     if reference:
-        mode = {"transfer": "transfer_predict", "extend": "extend_predict"}.get(goal or "transfer")
+        facts = reference_facts(reference)
+        # PCNtoolkit <= 1.3.0 cannot transfer a BLR model that has no warp (run_model.py check R7)
+        no_transfer = facts["kind"] == "BLR" and not facts["warp"]
+        mode = {"transfer": "transfer_predict", "extend": "extend_predict"}.get(
+            goal or ("extend" if no_transfer else "transfer"))
         if mode is None:
             die("--goal must be transfer or extend", 2)
+        why.append(f"reference model: {facts['kind'] or 'unknown type'}"
+                   + (f" with warp {facts['warp']}" if facts["warp"] else (" without a warp" if facts["kind"] == "BLR" else ""))
+                   + (f", saved by PCNtoolkit {facts['ptk_version']}" if facts["ptk_version"] else ""))
+        if no_transfer and mode == "extend_predict" and not goal:
+            why.append("extend chosen because transfer is not available: PCNtoolkit up to 1.3.0 cannot transfer "
+                       "a BLR model that was fitted without a warp")
+        if no_transfer and mode == "transfer_predict":
+            why.append("WARNING: PCNtoolkit up to 1.3.0 cannot transfer a BLR model fitted without a warp; "
+                       "`run_model.py plan` will refuse this recipe (check R7). Use --goal extend")
+        if facts["y_transform"]:
+            why.append(f"WARNING: the reference was fitted with y_transform='{facts['y_transform']}'; PCNtoolkit up "
+                       "to 1.3.0 writes corrupt centiles for such models and the plan will refuse it (check R7)")
         why.append("transfer: re-estimates the reference model for the new site(s); centiles then cover only the "
                    "covariate range of YOUR data, and a model may be transferred only once" if mode == "transfer_predict"
                    else "extend: refits on your data plus data synthesised from the reference model, keeping the "
@@ -98,10 +124,11 @@ def propose(t: dict, has_batch: bool, prefer: str | None, reference: str | None,
             why.append(f"WARNING: the smallest batch level has {t['min_level_n']} adaptation observations; "
                        "PCNtoolkit's guidance is 20 to 100 healthy controls per new site")
         other = "extend" if mode == "transfer_predict" else "transfer"
-        alternatives.append({"change": {"mode": f"{other}_predict"},
-                             "when": f"use {other} instead if " + (
-                                 "you need the reference sites and full covariate range kept, or will add more sites later"
-                                 if other == "extend" else "you only need scores for this site and want the fastest adaptation")})
+        if not (other == "transfer" and no_transfer):
+            alternatives.append({"change": {"mode": f"{other}_predict"},
+                                 "when": f"use {other} instead if " + (
+                                     "you need the reference sites and full covariate range kept, or will add more sites later"
+                                     if other == "extend" else "you only need scores for this site and want the fastest adaptation")})
         alternatives.append({"change": {"mode": "fit_predict", "reference_model": None},
                              "when": "fit from scratch if you have several hundred reference subjects of your own"})
         return {"algorithm": "from_reference", "mode": mode, "reference_model": str(Path(reference).resolve()),
@@ -141,8 +168,8 @@ def propose(t: dict, has_batch: bool, prefer: str | None, reference: str | None,
     recipe: dict = {"algorithm": alg, "mode": "fit_predict", "reference_model": None, "basis": basis,
                     "inscaler": "standardize", "outscaler": "standardize", "y_transform": None}
     if alg == "blr":
-        blr = {"n_iter": 1000, "tol": 1e-8, "optimizer": "l-bfgs-b", "l_bfgs_b_epsilon": 0.1, "l_bfgs_b_l": 0.1,
-               "l_bfgs_b_norm": "l2"}
+        # n_iter / tol are left out on purpose: PCNtoolkit only passes them to the "cg" optimiser
+        blr = {"optimizer": "l-bfgs-b", "l_bfgs_b_epsilon": 0.1, "l_bfgs_b_l": 0.1, "l_bfgs_b_norm": "l2"}
         if has_batch:
             blr["fixed_effect"] = True
             why.append(f"fixed batch effects in the mean: {100 * t['frac_site_shift']:.0f}% of variables shift by batch")
@@ -170,11 +197,12 @@ def propose(t: dict, has_batch: bool, prefer: str | None, reference: str | None,
                          "linear_sigma": True, "random_intercept_sigma": False,
                          "draws": 1500, "tune": 500, "chains": 4, "cores": 4, "nuts_sampler": "nutpie"}
         why.append(f"{lik} likelihood: " + {
-            "Beta": "bounded responses (min-max scaling is applied, as the Beta likelihood requires)",
+            "Beta": "bounded responses; they are passed to the model unscaled, because min-max scaling would put "
+                    "held-out values beyond the training range outside (0, 1), where the Beta density is zero",
             "SHASHb": f"{100 * t['frac_skewed']:.0f}% skewed / {100 * t['frac_heavy_tailed']:.0f}% heavy-tailed residuals",
             "Normal": "residuals look close to Gaussian"}[lik])
         if lik == "Beta":
-            recipe["inscaler"] = recipe["outscaler"] = "minmax"
+            recipe["outscaler"] = "none"
         if lik == "Normal":
             alternatives.append({"change": {"hbr": {"likelihood": "SHASHb"}},
                                  "when": "if QC flags skewed or heavy-tailed z-scores (slower to sample)"})

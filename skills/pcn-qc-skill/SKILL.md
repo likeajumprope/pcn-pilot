@@ -56,14 +56,17 @@ Five steps per response variable, each PASS, WARN, FAIL or SKIPPED:
 
 | Step | Question | Main evidence |
 |---|---|---|
-| S1 Completion and convergence | did it fit; are z-scores finite; did MCMC converge | model and result files, R-hat, ESS, divergences |
+| S1 Completion and convergence | did it fit; are z-scores finite; did MCMC converge | model and result files, R-hat, ESS, divergences (local runs) |
 | S2 Calibration | do held-out reference z-scores look like N(0, 1) | mean, SD, skewness, kurtosis, tail share, centile error, extreme values |
 | S3 Fit relative to the cohort | is this variable an outlier among its peers | MSLL, explained variance, MACE as modified Z; floors at MSLL 0 and EXPV 0 |
 | S4 Batch effects | is any site or sex level left shifted or rescaled | mean and SD of z per level |
 | S5 Covariate structure and centiles | any trend or spread left along the covariate; do centiles cross; train versus test | Spearman of z and of abs z, binned means, centile order, SD gap |
 
 SKIPPED means the check could not be computed, with the reason. It is not a pass: tell the user
-what was not checked. Codes, formulas and thresholds: `references/checks.md`.
+what was not checked. One SKIPPED is expected for HBR models fitted by cluster jobs: PCNtoolkit
+saves only the posterior draws, so divergent transitions are known only for local runs, where the
+model stage records them at fit time. Say so.
+Codes, formulas and thresholds: `references/checks.md`.
 
 **2. Summarise for the user.** Counts per grade, the dataset notes, the most common flags, and
 anything SKIPPED. Lead with what needs their attention.
@@ -128,7 +131,9 @@ List the original run first and fix runs after it; a variable is taken from the 
 it was accepted. Pass `--confirm` only after the signer has confirmed in the conversation, having
 seen the counts. The export refuses to run while any variable is undecided, awaiting a fix or
 escalated (`--allow-open` exports the accepted ones and lists the rest as excluded, if the signer
-asks for that).
+asks for that). It also refuses when the project has clinical subjects and an accepted variable
+has no clinical z-scores (cluster runs score train and test only); it prints the
+`run_model.py predict --data clinical` command to run first.
 
 It writes `z_test.csv`, `z_clinical.csv`, `z_train.csv` for the accepted variables,
 `accepted_models.csv`, and `qc_report.md`, and appends a row to the ledger

@@ -1,4 +1,4 @@
-# Validation checks V01 to V13
+# Validation checks V01 to V14
 
 `validate_dataset.py` writes the result of each check to `validation.json` and `data_report.md`.
 PASS needs nothing. FAIL blocks the model stage. WARN needs a decision from the user: accept it
@@ -19,6 +19,7 @@ and say why, or change the spec and rebuild.
 | V11 | sample size | fewer than 30 training rows or no test rows | fewer than 200 training or 50 test rows |
 | V12 | reference purity | non-reference rows in train or test | no reference group declared |
 | V13 | split balance | | a covariate differs by more than 0.3 SD between train and test |
+| V14 | storable names | a response-variable name ends in `_old`, equals `observations`, `subject_ids`, `centile` or `statistic`, contains a path separator, or has surrounding whitespace | |
 
 ## What each one means for a normative model, and what to do
 
@@ -26,7 +27,8 @@ and say why, or change the spec and rebuild.
 rows as independent. Options: keep (state the caveat), or keep one visit per subject.
 
 **V04 small or missing batch levels.** A level absent from train cannot be predicted: the model
-has no parameter for it. Either dismiss the level, or move toward transfer/extend, which is
+has no parameter for it, and PCNtoolkit refuses the whole table ("Data is not compatible with the
+model"), with BLR and HBR alike. Either dismiss the level, or move toward transfer/extend, which is
 designed for new sites. A level with few training rows is estimated poorly by BLR fixed effects;
 HBR pools small sites, and `choose_recipe.py` takes this into account. Tell the user which sites
 are small.
@@ -57,6 +59,14 @@ sample, prefer transferring a pretrained model over fitting from scratch.
 
 **V12 no reference group.** If the table holds only healthy subjects this is fine; say so in the
 summary. If it holds a mix and no label exists, the model is not a norm. Ask.
+
+**V14 storable names.** PCNtoolkit keeps one result file per split and merges each newly fitted
+variable into it. During that merge the previous copy of a shared column gets the suffix `_old`
+and every column ending in `_old` is then dropped, so a variable called `hippocampus_old` loses
+its z-scores as soon as the next variable is written (verified with PCNtoolkit 1.3.0). The other
+refused names are the files' own index columns, and names that cannot be a folder name (each
+model is saved in a folder named after its variable). Fix: rename the column in a copy of the
+source table and point the spec at the copy; sources themselves stay untouched.
 
 ## Batch-level dismissal
 

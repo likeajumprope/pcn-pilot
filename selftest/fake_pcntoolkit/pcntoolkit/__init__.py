@@ -4,11 +4,20 @@ It mimics the public surface PCN-Pilot calls (signatures, file layout, merge-on-
 result files, per-chunk Runner behaviour) with a trivial regression underneath.
 It is NOT a normative model and must never be used for analysis.
 
-Mirrored from PCNtoolkit 1.3.0 source and docs:
-  NormData.from_dataframe / .sel / .check_compatibility / result CSV layouts
-  NormativeModel(...).fit_predict / .predict / .save / .load / .transfer_predict / .extend_predict
+Mirrored from an installed PCNtoolkit 1.3.0, including the places where that release does not do
+what its documentation says (pcn_bridge.py lists them), so that fake mode exercises the same
+guards as real mode:
+  NormData.from_dataframe / .sel / result CSV layouts and their merge-on-write
+  NormativeModel(...).fit_predict / .predict / .save / .load / .synthesize
+  .transfer_predict   raises UnboundLocalError for a BLR model without a warp; saves saveplots=True
+  .extend_predict     raises KeyError when the new data has a batch level the reference lacks
+  .predict            asserts that every batch level is known; with saveplots=True it fails when the
+                      model holds more response variables than the data
+  basis functions     accept and ignore unknown keyword arguments
   save_dir/model/normative_model.json, save_dir/model/<rv>/regression_model.json, save_dir/results/*.csv
-  Runner(...).fit_predict(..., observe=False), check_jobs_status, load_from_state, runner_state.json
+  Runner(...)         checks <environment>/bin/python; check_jobs_status() -> (running, finished, failed);
+                      load_from_state() sets active_jobs / finished_jobs / failed_jobs; the Torque job
+                      writer needs Runner.random_sleep_scale, which the constructor does not set
 
 Fault injection for tests: PCN_FAKE_FAIL="rv1,rv2" makes fitting those variables raise.
 """
@@ -18,6 +27,7 @@ import copy
 import json
 import os
 import time
+import types
 from pathlib import Path
 
 import numpy as np
@@ -39,18 +49,18 @@ class _Basis:
 
 
 class LinearBasisFunction(_Basis):
-    def __init__(self, basis_column: int = 0):
+    def __init__(self, basis_column: int = 0, **kwargs):       # like PCNtoolkit: unknown names are swallowed
         super().__init__(basis_column)
 
 
 class PolynomialBasisFunction(_Basis):
-    def __init__(self, basis_column: int = 0, degree: int = 3):
+    def __init__(self, basis_column: int = 0, degree: int = 3, **kwargs):
         super().__init__(basis_column, degree=degree)
 
 
 class BsplineBasisFunction(_Basis):
     def __init__(self, basis_column: int = 0, degree: int = 3, nknots: int = 5, left_expand: float = 0.05,
-                 right_expand: float = 0.05, knot_method: str = "uniform", knots=None):
+                 right_expand: float = 0.05, knot_method: str = "uniform", knots=None, **kwargs):
         super().__init__(basis_column, degree=degree, nknots=nknots)
 
 
@@ -83,19 +93,20 @@ class BLR:
     def __init__(self, name: str = "template", n_iter: int = 100, tol: float = 1e-3, ard: bool = False,
                  optimizer: str = "l-bfgs-b", l_bfgs_b_l: float = 0.1, l_bfgs_b_epsilon: float = 0.1,
                  l_bfgs_b_norm: str = "l2", fixed_effect: bool = False, fixed_effect_slope: bool = False,
-                 heteroskedastic: bool = False, fixed_effect_var: bool = False, fixed_effect_var_slope: bool = False,
+                 fixed_effect_slope_indices=None, heteroskedastic: bool = False, fixed_effect_var: bool = False,
+                 fixed_effect_var_slope: bool = False, fixed_effect_var_slope_indices=None,
                  warp_name=None, warp_reparam: bool = False, basis_function_mean=None, basis_function_var=None,
-                 hyp0=None):
-        self.name = name
+                 hyp0=None, is_fitted: bool = False, is_from_dict: bool = False):
+        self.name, self.warp_name = name, warp_name
         self.cfg = dict(kind="blr", fixed_effect=fixed_effect, heteroskedastic=heteroskedastic,
                         gaussianise=bool(warp_name), fixed_effect_var=fixed_effect_var,
-                        degree=_degree(basis_function_mean), optimizer=optimizer)
+                        degree=_degree(basis_function_mean), optimizer=optimizer, warp_name=warp_name)
 
 
 class HBR:
     def __init__(self, name: str = "template", draws: int = 1500, tune: int = 500, cores: int = 4, chains: int = 4,
                  nuts_sampler: str = "nutpie", init: str = "jitter+adapt_diag", progressbar: bool = True,
-                 likelihood=None):
+                 likelihood=None, is_fitted: bool = False, is_from_dict: bool = False):
         self.name = name
         lik = likelihood or NormalLikelihood({}, {})
         self.cfg = dict(kind="hbr", fixed_effect=True, heteroskedastic=True,
@@ -143,6 +154,15 @@ class NormData:
     def unique_batch_effects(self):
         return {b: sorted(self.df[b].unique()) for b in self.batch_effect_dims}
 
+    @property
+    def batch_effect_counts(self):
+        return {b: {str(k): int(v) for k, v in self.df[b].value_counts(sort=False).items()} for b in self.batch_effect_dims}
+
+    @property
+    def batch_effect_covariate_ranges(self):
+        return {b: {str(lv): {c: {"min": float(g[c].min()), "max": float(g[c].max())} for c in self.covariates}
+                    for lv, g in self.df.groupby(b)} for b in self.batch_effect_dims}
+
     def check_compatibility(self, other):
         return self.covariates == other.covariates and self.batch_effect_dims == other.batch_effect_dims
 
@@ -157,6 +177,7 @@ class NormData:
             merged = merged.loc[:, ~merged.columns.str.endswith("_old")]
         else:
             merged = new
+        merged = merged.sort_index(level=0, key=lambda i: pd.to_numeric(i, errors="coerce"), kind="stable")
         merged.to_csv(path)
 
     def save_results(self, save_dir):
@@ -264,13 +285,12 @@ class NormativeModel:
         self.template_regression_model = template_regression_model
         self.savemodel, self.evaluate_model, self.saveresults, self.saveplots = savemodel, evaluate_model, saveresults, saveplots
         self.save_dir, self.inscaler, self.outscaler, self.name = save_dir, inscaler, outscaler, name
+        self.y_transform = y_transform
         self.regression_models: dict[str, _Reg] = {}
+        self.response_vars: list[str] = []      # a plain attribute, as in PCNtoolkit
         self.covariates, self.unique_batch_effects, self.covariate_ranges = [], {}, {}
+        self.batch_effect_counts, self.batch_effect_covariate_ranges = {}, {}
         self.is_fitted = False
-
-    @property
-    def response_vars(self):
-        return list(self.regression_models)
 
     def __getitem__(self, rv):
         return self.regression_models[rv]
@@ -278,11 +298,17 @@ class NormativeModel:
     def set_save_dir(self, d):
         self.save_dir = d
 
-    def fit(self, data: NormData):
+    def _register(self, data: NormData):
         self.covariates = list(data.covariates)
         self.unique_batch_effects = data.unique_batch_effects
+        self.batch_effect_counts = data.batch_effect_counts
+        self.batch_effect_covariate_ranges = data.batch_effect_covariate_ranges
         self.covariate_ranges = {c: {"min": float(data.df[c].min()), "max": float(data.df[c].max())}
                                  for c in data.covariates}
+
+    def fit(self, data: NormData):
+        self._register(data)
+        self.response_vars = list(data.response_vars)
         for rv in data.response_vars:          # like PCNtoolkit: no per-variable try/except
             reg = _Reg(self.template_regression_model.cfg)
             reg.fit(data.df, rv, data.covariates, data.batch_effect_dims)
@@ -292,7 +318,44 @@ class NormativeModel:
             self.save()
         self.predict(data)                    # PCNtoolkit also scores the fit data
 
+    def synthesize(self, data=None, n_samples=None, covariate_range_per_batch_effect=False):
+        """Draw batch labels by their training frequency, covariates within the ranges seen for those
+        labels, and responses from the fitted models. Uses numpy's global random state, like PCNtoolkit."""
+        assert self.is_fitted
+        dims = list(self.unique_batch_effects)
+        n = n_samples or sum(self.batch_effect_counts[dims[0]].values())
+        cols = {}
+        for b in dims:
+            levels = list(self.batch_effect_counts[b])
+            w = np.array([self.batch_effect_counts[b][lv] for lv in levels], float)
+            cols[b] = np.random.choice(levels, size=n, p=w / w.sum())
+        for c in self.covariates:
+            lo = np.full(n, self.covariate_ranges[c]["min"])
+            hi = np.full(n, self.covariate_ranges[c]["max"])
+            if covariate_range_per_batch_effect:
+                for b in dims:
+                    r = self.batch_effect_covariate_ranges[b]
+                    lo = np.maximum(lo, [r[lv][c]["min"] for lv in cols[b]])
+                    hi = np.minimum(hi, [r[lv][c]["max"] for lv in cols[b]])
+            cols[c] = np.random.uniform(lo, np.maximum(hi, lo))
+        df = pd.DataFrame(cols)
+        ys = {}
+        for rv in self.response_vars:
+            out = self.regression_models[rv].predict(df, rv, self.covariates, dims)
+            ys[rv] = out["yhat"] + out["sd"] * np.random.randn(n)
+
+        def arr(names):
+            src = ys if names is self.response_vars else cols
+            return types.SimpleNamespace(sel=lambda **kw: types.SimpleNamespace(values=np.asarray(src[next(iter(kw.values()))])))
+        return types.SimpleNamespace(X=arr(self.covariates), batch_effects=arr(dims), Y=arr(self.response_vars),
+                                     name="synthesized")
+
     def predict(self, data: NormData):
+        unknown = {b: [u for u in lv if u not in self.unique_batch_effects.get(b, [])]
+                   for b, lv in data.unique_batch_effects.items()}
+        assert not any(unknown.values()), "Data is not compatible with the model!"
+        if self.saveplots and set(self.response_vars) - set(data.response_vars):
+            raise KeyError("not all values found in index 'response_vars'")      # plot_centiles in 1.3.0
         data.Z, data.centiles, data.statistics = {}, {}, {}
         for rv in data.response_vars:
             out = self.regression_models[rv].predict(data.df, rv, data.covariates, data.batch_effect_dims)
@@ -309,7 +372,8 @@ class NormativeModel:
                 "MSLL": float(np.mean(nll - base)), "MLL": float(np.mean(nll)),
                 "ShapiroW": float(stats.shapiro(z)[0]), "MACE": float(np.mean([abs((cdf < c).mean() - c) for c in CENTILES])),
                 "MAPE": float(np.mean(np.abs((y - out["yhat"]) / np.where(y == 0, 1, y)))),
-                "EXPV": 1 - float(np.var(y - out["yhat"])) / var}
+                "EXPV": 1 - float(np.var(y - out["yhat"])) / var,
+                "Skewness": float(stats.skew(z)), "Kurtosis": float(stats.kurtosis(z))}
         if self.saveresults:
             data.save_results(os.path.join(self.save_dir, "results"))
         return data
@@ -322,10 +386,15 @@ class NormativeModel:
     def save(self, path=None):
         root = Path(path or self.save_dir) / "model"
         root.mkdir(parents=True, exist_ok=True)
+        cfg = self.template_regression_model.cfg
         meta = {"name": self.name, "save_dir": str(self.save_dir), "ptk_version": __version__,
                 "covariates": self.covariates, "unique_batch_effects": self.unique_batch_effects,
-                "covariate_ranges": self.covariate_ranges, "is_fitted": True, "inscaler": self.inscaler,
-                "outscaler": self.outscaler, "template": self.template_regression_model.cfg}
+                "covariate_ranges": self.covariate_ranges, "batch_effect_counts": self.batch_effect_counts,
+                "batch_effect_covariate_ranges": self.batch_effect_covariate_ranges,
+                "is_fitted": True, "inscaler": self.inscaler, "outscaler": self.outscaler,
+                "saveplots": self.saveplots, "y_transform": self.y_transform, "template": cfg,
+                # the two fields choose_recipe.py reads from a real model
+                "template_regression_model": {"type": cfg["kind"].upper(), "warp_name": cfg.get("warp_name")}}
         (root / "normative_model.json").write_text(json.dumps(meta, indent=1))
         for rv, reg in self.regression_models.items():
             (root / rv).mkdir(exist_ok=True)
@@ -335,21 +404,35 @@ class NormativeModel:
     def load(cls, path, into=None):
         root = Path(path) / "model"
         meta = json.loads((root / "normative_model.json").read_text())
-        tmpl = BLR()
+        tmpl = HBR() if meta["template"]["kind"] == "hbr" else BLR(warp_name=meta["template"].get("warp_name"))
         tmpl.cfg = meta["template"]
-        m = into or cls(tmpl, save_dir=str(path), inscaler=meta["inscaler"], outscaler=meta["outscaler"])
+        # like PCNtoolkit: the stored save_dir and saveplots come back, wherever the folder is now
+        m = into or cls(tmpl, save_dir=meta["save_dir"], inscaler=meta["inscaler"], outscaler=meta["outscaler"],
+                        saveplots=meta.get("saveplots", True), y_transform=meta.get("y_transform"))
         m.covariates, m.unique_batch_effects = meta["covariates"], meta["unique_batch_effects"]
         m.covariate_ranges, m.is_fitted = meta["covariate_ranges"], True
+        m.batch_effect_counts = meta.get("batch_effect_counts", {})
+        m.batch_effect_covariate_ranges = meta.get("batch_effect_covariate_ranges", {})
         for d in sorted(root.glob("*")):
             if (d / "regression_model.json").is_file():
                 m.regression_models[d.name] = _Reg.from_dict(json.loads((d / "regression_model.json").read_text())["model"])
+        m.response_vars = list(m.regression_models)
         return m
 
     def _adapt(self, data, save_dir, refit: bool):
+        cfg = self.template_regression_model.cfg
+        if not refit and cfg["kind"] == "blr" and not cfg.get("warp_name"):
+            # BLR.transfer in 1.0-1.3.0 only defines `y` inside `if self.warp:`
+            raise UnboundLocalError("cannot access local variable 'y' where it is not associated with a value")
+        if refit:
+            for b, levels in data.unique_batch_effects.items():     # NormData.merge keeps a stale registry
+                for lv in self.unique_batch_effects.get(b, []):
+                    if lv not in levels:
+                        raise KeyError(lv)
         new = NormativeModel(copy.deepcopy(self.template_regression_model), save_dir=save_dir or self.save_dir + "_transfer",
-                             inscaler=self.inscaler, outscaler=self.outscaler)
-        new.covariates, new.covariate_ranges = self.covariates, self.covariate_ranges
-        new.unique_batch_effects = data.unique_batch_effects
+                             inscaler=self.inscaler, outscaler=self.outscaler, saveplots=True,
+                             y_transform=self.y_transform)
+        new._register(data)
         site = max(data.batch_effect_dims, key=lambda b: data.df[b].nunique())
         for rv in [v for v in data.response_vars if v in self.regression_models]:
             reg = copy.deepcopy(self.regression_models[rv])
@@ -360,8 +443,10 @@ class NormativeModel:
                          "by": {k: float(v) for k, v in pd.Series(e).groupby(data.df[site].to_numpy()).mean().items()}}
             reg.transfered = not refit
             new.regression_models[rv] = reg
+        new.response_vars = list(new.regression_models)
         new.is_fitted = True
         new.save()
+        new.predict(data)                     # like PCNtoolkit: the adaptation data are scored too
         return new
 
     def transfer(self, transfer_data, save_dir=None, **kwargs):
@@ -387,10 +472,14 @@ class Runner:
                  n_cores: int = 1, time_limit="00:05:00", memory: str = "5GB", max_retries: int = 3,
                  environment=None, cross_validate: bool = False, cv_folds: int = 5,
                  preamble: str = "module load anaconda3", log_dir=None, temp_dir=None):
+        if parallelize and not (environment and os.path.exists(os.path.join(environment, "bin", "python"))):
+            raise ValueError(f"invalid environment: {environment}")
         self.n_batches, self.log_dir, self.temp_dir, self.job_type = n_batches or 1, log_dir, temp_dir, job_type
-        self.failed_jobs, self.finished = {}, {}
+        self.active_jobs, self.finished_jobs, self.failed_jobs = {}, {}, {}
 
     def _submit(self, fn, fit_data, predict_data):
+        if self.job_type == "torque":
+            self.random_sleep_scale           # AttributeError unless the caller set it, as in 1.1-1.3.0
         task = "fake_" + time.strftime("%Y-%m-%d_%H:%M:%S") + f"_{time.time_ns() % 1000}"
         self.unique_temp_dir = os.path.join(self.temp_dir, task)
         self.unique_log_dir = os.path.join(self.log_dir, task)
@@ -401,11 +490,11 @@ class Runner:
             try:
                 fn(a, b)
                 Path(self.unique_log_dir, f"{job}.success").touch()
-                self.finished[job] = str(1000 + i)
+                self.finished_jobs[job] = str(1000 + i)
             except Exception as e:  # a whole batch dies with its first failing variable
                 self.failed_jobs[job] = f"{type(e).__name__}: {e}"
         with open(os.path.join(self.unique_temp_dir, "runner_state.json"), "w") as f:
-            json.dump({"failed_jobs": self.failed_jobs, "finished": self.finished, "log_dir": self.log_dir,
+            json.dump({"failed_jobs": self.failed_jobs, "finished_jobs": self.finished_jobs, "log_dir": self.log_dir,
                        "temp_dir": self.temp_dir, "unique_temp_dir": self.unique_temp_dir,
                        "unique_log_dir": self.unique_log_dir}, f)
 
@@ -417,17 +506,19 @@ class Runner:
         self._submit(fn, fit_data, predict_data)
 
     def transfer_predict(self, model, fit_data, predict_data=None, save_dir=None, observe=True, **kwargs):
-        self._submit(lambda a, b: model.transfer_predict(a, b, save_dir=save_dir), fit_data, predict_data)
+        self._submit(lambda a, b: model.transfer_predict(a, b, save_dir=save_dir, **kwargs), fit_data, predict_data)
 
     def extend_predict(self, model, fit_data, predict_data=None, save_dir=None, observe=True, **kwargs):
         self._submit(lambda a, b: model.extend_predict(a, b, save_dir=save_dir), fit_data, predict_data)
 
     def check_jobs_status(self):
-        return {}, self.failed_jobs, self.finished
+        """(running, finished, failed), computed from active_jobs only, like PCNtoolkit."""
+        return dict(self.active_jobs), {}, {}
 
     @classmethod
     def load_from_state(cls, runner_file):
         st = json.load(open(runner_file))
         r = cls(log_dir=st["log_dir"], temp_dir=st["temp_dir"])
-        r.failed_jobs, r.finished = st["failed_jobs"], st["finished"]
+        # PCNtoolkit sorts the jobs here; calling check_jobs_status() again afterwards sees only running ones
+        r.active_jobs, r.finished_jobs, r.failed_jobs = {}, st["finished_jobs"], st["failed_jobs"]
         return r

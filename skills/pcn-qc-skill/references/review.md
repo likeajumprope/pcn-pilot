@@ -74,6 +74,10 @@ qc_review.py export --project <project> --runs <run>,<fix runs...> --name <name>
 
 - refuses without `--confirm`, without a signer, with a broken ledger, when the runs were fitted
   on different dataset builds, when the name already exists, and while variables are open
+- refuses when the project has clinical subjects and an accepted variable has no clinical
+  z-scores in its run. Cluster jobs score train and test only, so this is the normal state of a
+  cluster run until `run_model.py predict --project <project> --run <run> --data clinical` has
+  been run; the refusal prints that command
 - a variable's z-scores come from the last listed run in which it was accepted
 - `accepted_models.csv` maps each accepted variable to its run and model folder, with the
   reviewer and any caveat
